@@ -1,0 +1,18 @@
+# secrets / env
+.env
+.venv/
+venv/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# editor
+.vscode/
+.idea/
+
+# kit material kept local only (not part of the submission)
+openapi.yaml
+sample_data/
+sample_seed.py

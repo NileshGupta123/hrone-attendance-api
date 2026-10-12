@@ -13,6 +13,7 @@ Everything lives in this one file, in this order:
   6. request models        (validation)
   7. endpoints
 """
+import json
 import logging
 import os
 import re
@@ -23,6 +24,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Any, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
@@ -479,6 +481,19 @@ def build_attendance_query(
     return query
 
 
+def attendance_hint(query: dict) -> str:
+    """Which index serves a GET /attendance filter. Chosen explicitly (and passed as a hint) so the plan is always
+    an index scan that also delivers the documented order, never a collection scan plus an in-memory sort:
+      emp_code given -> (emp_code, date): equality on emp_code makes a reverse scan come out as date desc,
+      status given   -> (status, date desc, emp_code),
+      otherwise      -> (date desc, emp_code), which also serves date-range filters and the unfiltered list."""
+    if "emp_code" in query:
+        return "uniq_emp_date"
+    if "status" in query:
+        return "status_date_emp"
+    return "date_desc_emp"
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -493,11 +508,12 @@ def list_attendance(
     if date_from is not None and date_to is not None and date_from > date_to:
         raise unprocessable(["query", "date_from"], "date_from must not be after date_to")
     query = build_attendance_query(emp_code, date_from, date_to, status)
-    total = db.attendance_logs.count_documents(query)
+    hint = attendance_hint(query)
+    total = db.attendance_logs.count_documents(query, hint=hint)
     skip = (page - 1) * page_size
     items: list = []
     if skip < total:  # sort/skip/limit run inside MongoDB; nothing is loaded into Python except one page
-        cursor = db.attendance_logs.find(query).sort(ATTENDANCE_SORT).skip(skip).limit(page_size)
+        cursor = db.attendance_logs.find(query).hint(hint).sort(ATTENDANCE_SORT).skip(skip).limit(page_size)
         items = [serialize_attendance(d) for d in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
@@ -660,6 +676,9 @@ def _late_minutes(prefix: str) -> dict:
     return {"$ifNull": [f"${prefix}late_minutes", 0]}
 
 
+MONTHLY_HINT = "uniq_emp_date"  # (emp_code, date): equality on emp_code, range on date
+
+
 def employee_monthly_pipeline(emp_code: str, month_start: str, month_end: str, weekends: list) -> list:
     """One employee, one month: a single $match on the (emp_code, date) index, then one $group."""
     return [
@@ -675,6 +694,11 @@ def employee_monthly_pipeline(emp_code: str, month_start: str, month_end: str, w
             }
         },
     ]
+
+
+def department_summary_hint(department: Optional[str]) -> str:
+    """Index for the first $match on employees: (department, joined_on) with a department, else (joined_on)."""
+    return "dept_joined_on" if department is not None else "joined_on"
 
 
 def department_summary_pipeline(month_start: str, month_end: str, weekends: list, department: Optional[str]) -> list:
@@ -746,7 +770,8 @@ def department_summary_pipeline(month_start: str, month_end: str, weekends: list
 def employee_monthly(emp_code: str, month: str = Query(...)):
     info = month_info(month)
     emp = get_employee_or_404(emp_code)
-    rows = list(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, info["start"], info["end"], info["weekends"])))
+    pipeline = employee_monthly_pipeline(emp_code, info["start"], info["end"], info["weekends"])
+    rows = list(db.attendance_logs.aggregate(pipeline, hint=MONTHLY_HINT))
     agg = rows[0] if rows else {}
     # R7: working days are counted from joined_on for a mid-month joiner (and are 0 if joining after the month).
     counted_from = max(info["first"], parse_iso_date(emp["joined_on"]))
@@ -770,7 +795,7 @@ def department_summary(month: str = Query(...), department: Optional[str] = None
     info = month_info(month)
     pipeline = department_summary_pipeline(info["start"], info["end"], info["weekends"], department)
     items = []
-    for row in db.employees.aggregate(pipeline):
+    for row in db.employees.aggregate(pipeline, hint=department_summary_hint(department)):
         count = int(row["hours_count"])
         items.append(
             {
@@ -790,6 +815,9 @@ def department_summary(month: str = Query(...), department: Optional[str] = None
 # --------------------------------------------------------------------------- #
 # Late leaderboard (competition ranking)
 # --------------------------------------------------------------------------- #
+LEADERBOARD_HINT = "date_desc_emp"  # the first $match is a range on date
+
+
 def late_leaderboard_pipeline(month_start: str, month_end: str, department: Optional[str], limit: int) -> list:
     """Per employee: total late minutes in the month, then ranked inside MongoDB.
     $rank is "standard competition ranking" (1, 2, 2, 4): ties share a rank and the next rank is skipped.
@@ -835,7 +863,9 @@ def late_leaderboard(
 ):
     info = month_info(month)
     items = []
-    for row in db.attendance_logs.aggregate(late_leaderboard_pipeline(info["start"], info["end"], department, limit)):
+    for row in db.attendance_logs.aggregate(
+        late_leaderboard_pipeline(info["start"], info["end"], department, limit), hint=LEADERBOARD_HINT
+    ):
         items.append(
             {
                 "rank": int(row["rank"]),
@@ -949,8 +979,11 @@ def department_trend_pipeline(department: str, emp_codes: list, joined_dates: li
     ]
 
 
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(department: str, date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to")):
+TREND_HINT = "uniq_emp_date"  # $match is emp_code $in [...] plus a date range
+
+
+def trend_inputs(department: str, date_from: str, date_to: str) -> tuple:
+    """Validate the trend request and read what the pipeline needs. Shared with /admin/explain."""
     start = parse_iso_date(parse_date_param("from", date_from))
     end = parse_iso_date(parse_date_param("to", date_to))
     if end < start:
@@ -962,8 +995,15 @@ def department_trend(department: str, date_from: str = Query(..., alias="from"),
         raise HTTPException(status_code=404, detail="department not found")
     emp_codes = [e["emp_code"] for e in employees]
     joined_dates = sorted(e["joined_on"] for e in employees if e["joined_on"] <= end.isoformat())
+    return emp_codes, joined_dates, start, end
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to")):
+    emp_codes, joined_dates, start, end = trend_inputs(department, date_from, date_to)
     items = []
-    for row in db.attendance_logs.aggregate(department_trend_pipeline(department, emp_codes, joined_dates, start, end)):
+    pipeline = department_trend_pipeline(department, emp_codes, joined_dates, start, end)
+    for row in db.attendance_logs.aggregate(pipeline, hint=TREND_HINT):
         n = int(row["win_n"])
         moving = None
         if n > 0:
@@ -982,3 +1022,85 @@ def department_trend(department: str, date_from: str = Query(..., alias="from"),
             }
         )
     return {"department": department, "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# Admin: MongoDB explain
+# --------------------------------------------------------------------------- #
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
+
+
+def _require(endpoint: str, name: str, value: Any) -> Any:
+    if value is None:
+        raise unprocessable(["query", name], f"{name} is required to explain {endpoint}")
+    return value
+
+
+def _explain(command: dict) -> dict:
+    """Run `explain` with executionStats verbosity and turn the BSON reply into plain JSON."""
+    raw = db.command({"explain": command, "verbosity": "executionStats"})
+    return json.loads(json_util.dumps(raw, json_options=json_util.RELAXED_JSON_OPTIONS))
+
+
+def _explain_aggregate(collection: str, pipeline: list, hint: str) -> dict:
+    return _explain({"aggregate": collection, "pipeline": pipeline, "cursor": {}, "hint": hint})
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """Explain the main query/aggregation of an endpoint. It uses the very same builders, hints, sort and
+    pagination as the endpoint itself, so what is explained is what runs."""
+    if endpoint == "attendance_list":
+        date_from = parse_date_param("date_from", date_from)
+        date_to = parse_date_param("date_to", date_to)
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise unprocessable(["query", "date_from"], "date_from must not be after date_to")
+        query = build_attendance_query(emp_code, date_from, date_to, status)
+        collection = "attendance_logs"
+        result = _explain(
+            {
+                "find": collection,
+                "filter": query,
+                "sort": dict(ATTENDANCE_SORT),
+                "hint": attendance_hint(query),
+                "skip": (page - 1) * page_size,
+                "limit": page_size,
+            }
+        )
+    elif endpoint == "employee_monthly":
+        _require(endpoint, "emp_code", emp_code)
+        info = month_info(_require(endpoint, "month", month))
+        collection = "attendance_logs"
+        pipeline = employee_monthly_pipeline(emp_code, info["start"], info["end"], info["weekends"])
+        result = _explain_aggregate(collection, pipeline, MONTHLY_HINT)
+    elif endpoint == "department_summary":
+        info = month_info(_require(endpoint, "month", month))
+        collection = "employees"
+        pipeline = department_summary_pipeline(info["start"], info["end"], info["weekends"], department)
+        result = _explain_aggregate(collection, pipeline, department_summary_hint(department))
+    elif endpoint == "late_leaderboard":
+        info = month_info(_require(endpoint, "month", month))
+        collection = "attendance_logs"
+        pipeline = late_leaderboard_pipeline(info["start"], info["end"], department, limit)
+        result = _explain_aggregate(collection, pipeline, LEADERBOARD_HINT)
+    else:  # department_trend
+        emp_codes, joined_dates, start, end = trend_inputs(
+            _require(endpoint, "department", department), _require(endpoint, "from", from_), _require(endpoint, "to", to)
+        )
+        collection = "attendance_logs"
+        pipeline = department_trend_pipeline(department, emp_codes, joined_dates, start, end)
+        result = _explain_aggregate(collection, pipeline, TREND_HINT)
+    return {"endpoint": endpoint, "collection": collection, "explain": result}

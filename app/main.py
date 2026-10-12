@@ -785,3 +785,200 @@ def department_summary(month: str = Query(...), department: Optional[str] = None
             }
         )
     return {"month": month, "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# Late leaderboard (competition ranking)
+# --------------------------------------------------------------------------- #
+def late_leaderboard_pipeline(month_start: str, month_end: str, department: Optional[str], limit: int) -> list:
+    """Per employee: total late minutes in the month, then ranked inside MongoDB.
+    $rank is "standard competition ranking" (1, 2, 2, 4): ties share a rank and the next rank is skipped.
+    The limit is applied to the RANK (rank <= limit), after ranking, so a tie at the cutoff is kept in full."""
+    pipeline: list = [
+        {"$match": {"date": {"$gte": month_start, "$lte": month_end}}},
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": _late_minutes("")},
+                "late_count": {"$sum": {"$cond": [{"$gt": [_late_minutes(""), 0]}, 1, 0]}},
+            }
+        },
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},  # no matching employee -> the row disappears: logs of unknown employees are ignored
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})  # ranking happens inside the department only
+    pipeline += [
+        {
+            "$project": {
+                "_id": 0,
+                "emp_code": "$_id",
+                "name": "$emp.name",
+                "department": "$emp.department",
+                "total_late_minutes": 1,
+                "late_count": 1,
+            }
+        },
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "emp_code": 1}},
+    ]
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(...),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    info = month_info(month)
+    items = []
+    for row in db.attendance_logs.aggregate(late_leaderboard_pipeline(info["start"], info["end"], department, limit)):
+        items.append(
+            {
+                "rank": int(row["rank"]),
+                "emp_code": row["emp_code"],
+                "name": row["name"],
+                "department": row["department"],
+                "total_late_minutes": int(row["total_late_minutes"]),
+                "late_count": int(row["late_count"]),
+            }
+        )
+    return {"month": month, "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# Department daily trend
+# --------------------------------------------------------------------------- #
+MAX_TREND_DAYS = 92
+
+
+def _utc_midnight(d: date) -> datetime:
+    return datetime(d.year, d.month, d.day, tzinfo=UTC)
+
+
+def department_trend_pipeline(department: str, emp_codes: list, joined_dates: list, start: date, end: date) -> list:
+    """One row per calendar day from start to end, built entirely inside MongoDB:
+      1. group the department's logs by date (present value, late count); one zero-valued row for `start` is
+         unioned in first so $densify always has an input row, even when the department has no logs at all,
+      2. $densify inserts a row for every missing day (weekends and days without records included),
+      3. headcount per day = employees whose joined_on <= that day (R9),
+      4. attendance_rate as an integer number of 1/10000 (half-up, so rate_int / 10000 is the 4-decimal rate),
+      5. $setWindowFields adds the sum and count of rate_int over the current row and up to 6 preceding rows.
+    The moving average itself is finished in Python with integer arithmetic (see department_trend)."""
+    start_dt = _utc_midnight(start)
+    end_dt = _utc_midnight(end)
+    return [
+        {"$match": {"emp_code": {"$in": emp_codes}, "date": {"$gte": start.isoformat(), "$lte": end.isoformat()}}},
+        {
+            "$group": {
+                "_id": "$date",
+                "present": {"$sum": {"$cond": [{"$in": ["$status", list(PRESENCE_STATUSES)]}, _present_value(""), 0]}},
+                "late": {"$sum": {"$cond": [{"$gt": [_late_minutes(""), 0]}, 1, 0]}},
+            }
+        },
+        {
+            "$unionWith": {
+                "coll": "employees",
+                "pipeline": [  # the match uses the (department, emp_code) index, so this is no collection scan
+                    {"$match": {"department": department}},
+                    {"$limit": 1},
+                    {"$replaceWith": {"_id": start.isoformat(), "present": 0, "late": 0}},
+                ],
+            }
+        },
+        {"$group": {"_id": "$_id", "present": {"$sum": "$present"}, "late": {"$sum": "$late"}}},
+        {"$addFields": {"day": {"$dateFromString": {"dateString": "$_id", "format": "%Y-%m-%d"}}}},
+        # Upper bound of $densify is exclusive, so go one day past `end`; the $match below trims anything extra.
+        {"$densify": {"field": "day", "range": {"step": 1, "unit": "day", "bounds": [start_dt, end_dt + timedelta(days=1)]}}},
+        {"$match": {"day": {"$gte": start_dt, "$lte": end_dt}}},
+        {"$sort": {"day": 1}},
+        {
+            "$addFields": {
+                "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$day"}},
+                "present_count": {"$ifNull": ["$present", 0]},
+                "late_count": {"$ifNull": ["$late", 0]},
+                "is_working_day": {"$eq": [{"$in": [{"$dayOfWeek": "$day"}, [1, 7]]}, False]},  # 1 = Sunday, 7 = Saturday
+            }
+        },
+        {
+            "$addFields": {
+                "headcount": {
+                    "$size": {"$filter": {"input": {"$literal": joined_dates}, "as": "j", "cond": {"$lte": ["$$j", "$date"]}}}
+                }
+            }
+        },
+        {
+            "$addFields": {
+                # floor(x + 0.5) is half-up; x = present * 10000 / headcount, so the only ties are exact .5 values.
+                "rate_int": {
+                    "$cond": [
+                        {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                        {"$floor": {"$add": [{"$divide": [{"$multiply": ["$present_count", 10000]}, "$headcount"]}, 0.5]}},
+                        None,
+                    ]
+                }
+            }
+        },
+        {"$addFields": {"has_rate": {"$cond": [{"$eq": ["$rate_int", None]}, 0, 1]}}},
+        {
+            "$setWindowFields": {
+                "sortBy": {"day": 1},
+                "output": {
+                    "win_sum": {"$sum": "$rate_int", "window": {"documents": [-6, 0]}},
+                    "win_n": {"$sum": "$has_rate", "window": {"documents": [-6, 0]}},
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "date": 1,
+                "is_working_day": 1,
+                "headcount": 1,
+                "present_count": 1,
+                "late_count": 1,
+                "rate_int": 1,
+                "win_sum": 1,
+                "win_n": 1,
+            }
+        },
+        {"$sort": {"date": 1}},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to")):
+    start = parse_iso_date(parse_date_param("from", date_from))
+    end = parse_iso_date(parse_date_param("to", date_to))
+    if end < start:
+        raise unprocessable(["query", "to"], "to must not be before from")
+    if (end - start).days + 1 > MAX_TREND_DAYS:
+        raise unprocessable(["query", "to"], f"the range must not exceed {MAX_TREND_DAYS} days")
+    employees = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
+    if not employees:
+        raise HTTPException(status_code=404, detail="department not found")
+    emp_codes = [e["emp_code"] for e in employees]
+    joined_dates = sorted(e["joined_on"] for e in employees if e["joined_on"] <= end.isoformat())
+    items = []
+    for row in db.attendance_logs.aggregate(department_trend_pipeline(department, emp_codes, joined_dates, start, end)):
+        n = int(row["win_n"])
+        moving = None
+        if n > 0:
+            total = int(round(row["win_sum"]))
+            moving = ((2 * total + n) // (2 * n)) / 10000  # exact integer half-up of total / n, then 4 decimals
+        rate_int = row.get("rate_int")
+        items.append(
+            {
+                "date": row["date"],
+                "is_working_day": bool(row["is_working_day"]),
+                "headcount": int(row["headcount"]),
+                "present_count": round_half_up(float(row["present_count"]), 2),
+                "late_count": int(row["late_count"]),
+                "attendance_rate": None if rate_int is None else int(round(rate_int)) / 10000,
+                "moving_avg_7d": moving,
+            }
+        )
+    return {"department": department, "items": items}
